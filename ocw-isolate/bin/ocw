@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+# ocw — opencode session isolation via overlayfs (frozen lowerdir + private upperdir).
+# Each session works in its own COW view of the repo: an agent CANNOT
+# destroy another one's work (no cross git checkout --, no shared .git).
+#
+# Usage:
+#   ocw up <session>        start an isolated session in this repo (launches opencode2)
+#   ocw merge <session>     merge the isolated session back into the real repo (git fetch + merge)
+#   ocw down <session>      unmount + delete the session (exit opencode2 first)
+#   ocw list                list sessions for this repo
+#   ocw status <session>    details of a session
+#   ocw prune               remove dead sessions (not mounted)
+#
+# Env:
+#   OCW_HOME       session root (default ~/.cache/ocw)
+#   OCW_OPENCODE   opencode binary (default opencode2)
+#   OCW_MOUNT      mount | fuse | sudo (default auto: fuse-overlayfs if available, else sudo)
+
+set -euo pipefail
+
+OCW_HOME="${OCW_HOME:-$HOME/.cache/ocw}"
+OPENCODE_BIN="${OCW_OPENCODE:-opencode2}"
+
+die() { echo "ocw: $*" >&2; exit 1; }
+info() { echo "ocw: $*" >&2; }
+
+SESSION_RE='^[a-zA-Z0-9][a-zA-Z0-9._-]*$'
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing command: $1"; }
+
+# --- résolution du repo + racine de session ---------------------------------
+resolve_repo() {
+  git rev-parse --show-toplevel 2>/dev/null || die "pas dans un repo git (cwd = $(pwd))"
+}
+
+# $(find_session_root <session>): look for $OCW_HOME/*/<session>, first in the current repo
+find_session_root() {
+  local session="$1" repo repo_name
+  if repo="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    repo_name="$(basename "$repo")"
+    local root="$OCW_HOME/$repo_name/$session"
+    [ -f "$root/upper/.ocw/meta.json" ] && { echo "$root"; return 0; }
+  fi
+  local matches=()
+  for meta_file in "$OCW_HOME"/*/*/upper/.ocw/meta.json; do
+    [ -f "$meta_file" ] || continue
+    if [ "$(meta_field "$(read_meta "$meta_file")" session)" = "$session" ]; then
+      matches+=("${meta_file%/upper/.ocw/meta.json}")
+    fi
+  done
+  case "${#matches[@]}" in
+    0) die "session '$session' not found (ocw up $session ?)";;
+    1) echo "${matches[0]}";;
+    *) die "session '$session' ambiguous — multiple repos — run the command from the relevant repo";;
+  esac
+}
+
+read_meta() { cat "$1" 2>/dev/null; }
+
+meta_field() { # <meta> <field>
+  sed -n "s/.*\"$2\" *: *\"\([^\"]*\)\".*/\1/p" <<<"$1" | head -1
+}
+
+mounted() { mountpoint -q "$1" 2>/dev/null; }
+
+is_isolated_cwd() { [ -f "$(pwd)/.ocw/meta.json" ]; }
+
+# --- montage -----------------------------------------------------------------
+mount_overlay() { # <snap> <upper> <work> <merged>
+  local snap="$1" upper="$2" work="$3" merged="$4" how
+  how="${OCW_MOUNT:-auto}"
+  if [ "$how" = "auto" ] || [ "$how" = "fuse" ]; then
+    if command -v fuse-overlayfs >/dev/null 2>&1; then
+      fuse-overlayfs -o lowerdir="$snap",upperdir="$upper",workdir="$work" "$merged"
+      return 0
+    fi
+    [ "$how" = "fuse" ] && die "fuse-overlayfs not found (apt install fuse-overlayfs) — or set OCW_MOUNT=sudo"
+  fi
+  need_cmd sudo
+  sudo mount -t overlay overlay -o "lowerdir=$snap,upperdir=$upper,workdir=$work" "$merged"
+}
+
+umount_overlay() { # <merged>
+  if command -v fusermount3 >/dev/null 2>&1; then
+    fusermount3 -u "$1" 2>/dev/null && return 0
+  fi
+  sudo umount "$1" 2>/dev/null
+}
+
+# --- list helpers --------------------------------------------------------------
+auto_name() { echo "auto-$(date +%m%d-%H%M%S)"; }
+
+# $(auto_select [session]): résout la session pour merge/down
+#   - session donné → vérifie qu'il existe
+#   - session vide → unique session du repo courant (sinon global, sinon erreur)
+auto_select() {
+  local wanted="${1:-}" names=() name="" repo repo_name
+  if [ -n "$wanted" ]; then
+    find_session_root "$wanted" >/dev/null
+    echo "$wanted"
+    return 0
+  fi
+  if repo="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    repo_name="$(basename "$repo")"
+    for meta_file in "$OCW_HOME/$repo_name"/*/upper/.ocw/meta.json; do
+      [ -f "$meta_file" ] || continue
+      names+=("$(meta_field "$(read_meta "$meta_file")" session)")
+    done
+  fi
+  if [ "${#names[@]}" -eq 0 ]; then
+    for meta_file in "$OCW_HOME"/*/*/upper/.ocw/meta.json; do
+      [ -f "$meta_file" ] || continue
+      names+=("$(meta_field "$(read_meta "$meta_file")" session)")
+    done
+  fi
+  case "${#names[@]}" in
+    0) die "no session — create one with \`ocw\` (or ocw up <name>)";;
+    1) echo "${names[0]}";;
+    *) die "several sessions: ${names[*]} — specify one: ocw $2 <name>";;
+  esac
+}
+
+# --- up ----------------------------------------------------------------------
+cmd_up() {
+  local session="$1"
+  [ -n "$session" ] || session="$(auto_name)"
+  [[ "$session" =~ $SESSION_RE ]] || die "invalid session name: '$session' (alnum . _ -)"
+  is_isolated_cwd && die "already inside an isolated session ($(pwd))"
+  need_cmd git
+
+  local repo repo_name root snap upper work merged branch created
+  repo="$(resolve_repo)"
+  repo_name="$(basename "$repo")"
+  root="$OCW_HOME/$repo_name/$session"
+  [ -e "$root" ] && die "session '$session' already exists ($root)"
+  mkdir -p "$OCW_HOME" "$root"
+  snap="$root/snapshot"; upper="$root/upper"; work="$root/work"; merged="$root/merged"
+  mkdir -p "$upper" "$work" "$merged"
+
+  branch="$(git -C "$repo" branch --show-current 2>/dev/null || echo detached)"
+  created="$(date +%s)"
+
+  info "snapshotting repo (local clone, HEAD=$branch)…"
+  git clone --no-hardlinks --quiet "$repo" "$snap" || die "snapshot clone failed"
+  git -C "$snap" remote remove origin || true
+  printf '.ocw/\n' >> "$snap/.git/info/exclude"
+
+  mkdir -p "$upper/.ocw"
+  cat > "$upper/.ocw/meta.json" <<EOF
+{
+  "ocw": 1,
+  "session": "$session",
+  "repo": "$repo",
+  "branch": "$branch",
+  "created": $created,
+  "snapshot": "$snap",
+  "upper": "$upper",
+  "merged": "$merged",
+  "mergedAt": null
+}
+EOF
+
+  if [ "${OCW_LINK_NODE_MODULES:-0}" = "1" ] && [ -d "$repo/node_modules" ]; then
+    ln -s "$repo/node_modules" "$upper/node_modules"
+    info "node_modules partagé (symlink) — OCW_LINK_NODE_MODULES=1"
+  fi
+
+  info "mounting overlay (lower=frozen snapshot, upper=private)…"
+  mount_overlay "$snap" "$upper" "$work" "$merged"
+  mounted "$merged" || die "mount failed"
+
+  echo "----------------------------------------------------------------"
+  echo "  session ocw: $session"
+  echo "  repo:        $repo"
+  echo "  view:        $merged"
+  echo "  isolation:   git privé, upperdir privé — tu ne peux PAS écraser"
+  echo "               le travail des autres agents (ni être écrasé)."
+  echo "  merge back:  ocw merge $session   (or the ocw_merge tool)"
+  echo "  cleanup:     exit opencode2 then: ocw down $session"
+  echo "----------------------------------------------------------------"
+
+  if [ -t 0 ] && [ -t 1 ]; then
+    "$OPENCODE_BIN" "$merged" || true
+    info "session finished."
+    local ans=""
+    read -r -p "ocw: merge '$session' into '$repo'? [y/N] " ans || true
+    if [[ "$ans" =~ ^[yYoO]$ ]]; then
+      cmd_merge "$session" || true
+    fi
+    read -r -p "ocw: clean up the session (unmount + rm)? [y/N] " ans || true
+    if [[ "$ans" =~ ^[yYoO]$ ]]; then
+      cmd_down "$session" || true
+    fi
+  else
+    exec "$OPENCODE_BIN" "$merged"
+  fi
+}
+
+# --- merge -------------------------------------------------------------------
+cmd_merge() {
+  local session
+  session="$(auto_select "$1" merge)"
+  need_cmd git
+  local root meta repo merged name branch
+  root="$(find_session_root "$session")"
+  meta="$(read_meta "$root/upper/.ocw/meta.json")"
+  repo="$(meta_field "$meta" repo)"
+  merged="$(meta_field "$meta" merged)"
+  mounted "$merged" || die "session '$session' not mounted (ocw up first)"
+
+  info "committing session '$session'…"
+  if [ -n "$(git -C "$merged" status --porcelain)" ]; then
+    git -C "$merged" add -A
+    git -C "$merged" commit -m "ocw: $session" || die "commit failed (git identity?) — commit manually and retry"
+  fi
+
+  name="$(meta_field "$meta" session)"
+  info "fetching '$merged' → refs/ocw/$name in '$repo'…"
+  git -C "$repo" fetch "$merged" "HEAD:refs/ocw/$name" || die "fetch failed"
+
+  info "merging refs/ocw/$name into '$repo'…"
+  if git -C "$repo" merge --no-edit "refs/ocw/$name"; then
+    sed -i "s/\"mergedAt\": null/\"mergedAt\": $(date +%s)/" "$root/upper/.ocw/meta.json"
+    echo "ocw: session '$session' merged into '$repo' ✓"
+  else
+    die "CONFLICTS — resolve them in '$repo' then: git -C '$repo' merge --continue"
+  fi
+}
+
+# --- down --------------------------------------------------------------------
+cmd_down() {
+  local session
+  session="$(auto_select "$1" down)"
+  local root meta merged
+  root="$(find_session_root "$session")"
+  meta="$(read_meta "$root/upper/.ocw/meta.json")"
+  merged="$(meta_field "$meta" merged)"
+
+  if mounted "$merged"; then
+    info "unmounting '$merged'…"
+    if ! umount_overlay "$merged"; then
+      die "session busy — exit opencode2 (session '$session') then run ocw down $session"
+    fi
+  fi
+  rm -rf "$root"
+  echo "ocw: session '$session' removed ✓"
+}
+
+# --- list --------------------------------------------------------------------
+cmd_list() {
+  local repo repo_name found=0
+  if repo="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    repo_name="$(basename "$repo")"
+  else
+    repo_name="*"
+  fi
+  for meta_file in "$OCW_HOME/$repo_name"/*/upper/.ocw/meta.json; do
+    [ -f "$meta_file" ] || continue
+    local meta merged session branch dirty
+    meta="$(read_meta "$meta_file")"
+    session="$(meta_field "$meta" session)"
+    merged="$(meta_field "$meta" merged)"
+    branch="$(meta_field "$meta" branch)"
+    dirty="-"
+    if mounted "$merged" 2>/dev/null; then
+      dirty="$(git -C "$merged" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+    fi
+    printf '%-20s %-8s %5s modifs  %s\n' "$session" "$([ "$(mounted "$merged" 2>/dev/null && echo M || echo X)" = M ] && echo "mounted" || echo "dead")" "$dirty" "$branch"
+    found=1
+  done
+  [ "$found" = 1 ] || { [ "$repo_name" = "*" ] && echo "ocw: no ocw session (ocw up <name> to start one)" || echo "ocw: no session for '$repo' (ocw up <name> to start one)"; }
+}
+
+# --- status ------------------------------------------------------------------
+cmd_status() {
+  local session="$1"
+  local root meta repo merged branch dirty commits
+  root="$(find_session_root "$session")"
+  meta="$(read_meta "$root/upper/.ocw/meta.json")"
+  repo="$(meta_field "$meta" repo)"
+  merged="$(meta_field "$meta" merged)"
+  echo "session:  $session"
+  echo "repo:     $repo"
+  echo "view:     $merged"
+  if mounted "$merged"; then
+    branch="$(git -C "$merged" branch --show-current 2>/dev/null || echo detached)"
+    dirty="$(git -C "$merged" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+    commits="$(git -C "$merged" log --oneline -1 2>/dev/null || echo -)"
+    echo "state:    mounted (branch $branch, $dirty modified files)"
+    [ "$dirty" != 0 ] && git -C "$merged" status --porcelain 2>/dev/null | head -30
+    echo "dernier:  $commits"
+  else
+    echo "state:    unmounted"
+  fi
+}
+
+# --- prune -------------------------------------------------------------------
+cmd_prune() {
+  local n=0
+  for meta_file in "$OCW_HOME"/*/*/upper/.ocw/meta.json; do
+    [ -f "$meta_file" ] || continue
+    local merged
+    merged="$(meta_field "$(read_meta "$meta_file")" merged)"
+    if ! mounted "$merged" 2>/dev/null; then
+      local root="${meta_file%/upper/.ocw/meta.json}"
+      local ans=""
+      read -r -p "ocw: remove '$root' (dead session)? [y/N] " ans || true
+      if [[ "$ans" =~ ^[yYoO]$ ]]; then
+        rm -rf "$root" && n=$((n + 1))
+      fi
+    fi
+  done
+  echo "ocw: $n session(s) removed"
+}
+
+# --- main --------------------------------------------------------------------
+sub="${1:-}"; shift || true
+case "$sub" in
+  "")     cmd_up "" ;;
+  up)     cmd_up "${1:-}" ;;
+  merge)  cmd_merge "${1:-}" ;;
+  down)   cmd_down "${1:-}" ;;
+  list)   cmd_list ;;
+  status) cmd_status "${1:-}" ;;
+  prune)  cmd_prune ;;
+  *)      if [[ "$sub" =~ $SESSION_RE ]]; then cmd_up "$sub"; else die "unknown subcommand: $sub"; fi ;;
+esac
