@@ -1,5 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
+import { Plugin } from "@opencode-ai/plugin/tui"
 
 const id = "subagents-manager"
 
@@ -551,9 +552,9 @@ function SubagentsPanel(props: { ctx: PluginCtx; sessionID?: string }) {
   )
 }
 
-const plugin = {
+const plugin = Plugin.define({
   id,
-  async setup(ctx: PluginCtx) {
+  setup(ctx: PluginCtx) {
     ctx.ui.slot({
       append: "sidebar.content",
       render: (input) => <SubagentsPanel ctx={ctx} sessionID={input?.sessionID} />,
@@ -563,6 +564,6 @@ const plugin = {
       render: (input) => <SubagentComposer ctx={ctx} sessionID={input?.sessionID} />,
     })
   },
-}
+})
 
 export default plugin

@@ -1,10 +1,27 @@
 /** @jsxImportSource @opentui/solid */
+/**
+ * tui-carousel — sidebar slide carousel for opencode2.
+ *
+ * Modern opencode2 CLI plugin API (`@opencode-ai/plugin/tui`):
+ *   - default export = `Plugin.define({ id, setup })`
+ *   - `setup(context)` registers `sidebar.content` and embeds the plugins listed
+ *     in `~/.config/opencode/carousel.json` (each child provides a
+ *     `sidebar.content` render that the carousel captures and shows per slide).
+ *
+ * Installation (discovery layout, auto-loaded by the opencode2 TUI):
+ *   ~/.config/opencode/plugins/carousel/tui.ts   -> re-exports this file
+ *   ~/.config/opencode/plugins/carousel/index.ts -> minimal server stub
+ *
+ * Child plugins may export either `Plugin.define(...)` (modern, has `.tui`) or
+ * the legacy `{ id, setup }` shape; both are handled here.
+ */
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import { createStore } from "solid-js/store"
-import { readFileSync } from "node:fs"
 import { appendFile } from "node:fs/promises"
+import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { isAbsolute, join, resolve } from "node:path"
+import { Plugin } from "@opencode-ai/plugin/tui"
 
 const id = "carousel"
 
@@ -38,11 +55,11 @@ function loadConfig(): { plugins?: ConfigEntry[]; slides?: ConfigSlide[]; keybin
   }
 }
 
-function logLine(obj: unknown): void {
+function logLine(obj: Record<string, unknown>): void {
   try {
     void appendFile(
       "/tmp/opencode/carousel-load.jsonl",
-      JSON.stringify({ ts: new Date().toISOString(), ...(obj as object) }) + "\n",
+      JSON.stringify({ ts: new Date().toISOString(), ...obj }) + "\n",
     )
   } catch {
     /* ignore */
@@ -60,9 +77,10 @@ type Theme = {
       info: { default: string }
     }
   }
+  border: { default: string }
 }
 
-type PluginCtx = {
+type HostCtx = {
   theme: Theme
   data: {
     on: (type: string, handler: (event: unknown) => void) => () => void
@@ -80,7 +98,7 @@ type PluginCtx = {
       set: (opts: { size?: "medium" | "large" | "xlarge" }) => void
       clear: () => void
     }
-    toast: { show: (opts: { variant?: "info" | "success" | "warning" | "error"; message: string }) => void }
+    toast: { show: (opts: { variant?: string; message: string }) => void }
   }
   keymap: {
     layer: (
@@ -129,15 +147,15 @@ export function getLoadedSlides(): ReadonlyArray<Slide> {
   return slides.list
 }
 
-function registerKeymap(ctx: PluginCtx): (() => void) | undefined {
+function registerKeymap(ctx: HostCtx): (() => void) | undefined {
   const binds = loadConfig().keybinds ?? {}
   const makeCmd = (
-    id: string,
+    commandId: string,
     title: string,
     bind: string | undefined,
     run: () => void,
   ): { id: string; title: string; bind?: string; run: () => void } => {
-    const cmd: { id: string; title: string; bind?: string; run: () => void } = { id, title, run }
+    const cmd: { id: string; title: string; bind?: string; run: () => void } = { id: commandId, title, run }
     if (bind) cmd.bind = bind
     return cmd
   }
@@ -151,7 +169,13 @@ function registerKeymap(ctx: PluginCtx): (() => void) | undefined {
         ],
       }),
     ) as (() => void) | undefined
-    logLine({ event: "keymap", hasKeymap: !!ctx.keymap, hasLayer: typeof ctx.keymap?.layer === "function", off: typeof layer, binds })
+    logLine({
+      event: "keymap",
+      hasKeymap: !!ctx.keymap,
+      hasLayer: typeof ctx.keymap?.layer === "function",
+      off: typeof layer,
+      binds,
+    })
     return layer
   } catch (err) {
     logLine({ event: "keymap-error", error: err instanceof Error ? err.message : String(err) })
@@ -159,7 +183,7 @@ function registerKeymap(ctx: PluginCtx): (() => void) | undefined {
   }
 }
 
-async function loadSlideItems(ctx: PluginCtx, entries: ConfigEntry[]): Promise<PanelItem[]> {
+async function loadSlideItems(ctx: HostCtx, entries: ConfigEntry[]): Promise<PanelItem[]> {
   const items: PanelItem[] = []
   for (const entry of entries) {
     if (entry.enabled === false) {
@@ -170,14 +194,14 @@ async function loadSlideItems(ctx: PluginCtx, entries: ConfigEntry[]): Promise<P
     try {
       const mod = await import(target)
       const plugin = (mod as { default?: unknown }).default as
-        | { id?: unknown; setup?: unknown }
+        | { id?: unknown; setup?: unknown; tui?: unknown }
         | undefined
-      if (!plugin || typeof plugin.id !== "string" || !plugin.id || typeof plugin.setup !== "function") {
-        logLine({ event: "skip", path: target, reason: "invalid module shape" })
+      if (!plugin || typeof plugin.id !== "string" || !plugin.id) {
+        logLine({ event: "skip", path: target, reason: "invalid module shape (no id)" })
         continue
       }
       const captured: { render?: (input: PanelInput) => unknown } = {}
-      const wrapped: PluginCtx = {
+      const wrapped: HostCtx = {
         ...ctx,
         ui: {
           ...ctx.ui,
@@ -190,7 +214,12 @@ async function loadSlideItems(ctx: PluginCtx, entries: ConfigEntry[]): Promise<P
           },
         },
       }
-      await (plugin.setup as (c: PluginCtx) => Promise<void> | void)(wrapped)
+      const fn = (plugin.tui ?? plugin.setup) as ((c: HostCtx) => Promise<void> | void) | undefined
+      if (typeof fn !== "function") {
+        logLine({ event: "skip", path: target, id: plugin.id, reason: "no setup/tui function" })
+        continue
+      }
+      await fn(wrapped)
       if (captured.render) {
         items.push({ id: plugin.id, label: entry.label ?? plugin.id, render: captured.render })
         logLine({ event: "loaded", path: target, id: plugin.id })
@@ -202,9 +231,7 @@ async function loadSlideItems(ctx: PluginCtx, entries: ConfigEntry[]): Promise<P
       try {
         ctx.ui.toast.show({
           variant: "error",
-          message: `carousel: failed to load ${entry.path}: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
+          message: `carousel: failed to load ${entry.path}: ${err instanceof Error ? err.message : String(err)}`,
         })
       } catch {
         /* no toast */
@@ -221,7 +248,7 @@ function buildSlideDefs(cfg: ReturnType<typeof loadConfig>): ConfigSlide[] {
   return out
 }
 
-function Carousel(props: { ctx: PluginCtx; sessionID?: string }) {
+function Carousel(props: { ctx: HostCtx; sessionID?: string }) {
   const theme = () => props.ctx.theme
 
   let offKeymap: (() => void) | undefined
@@ -288,9 +315,9 @@ function Carousel(props: { ctx: PluginCtx; sessionID?: string }) {
   )
 }
 
-const plugin = {
+const plugin = Plugin.define({
   id,
-  async setup(ctx: PluginCtx) {
+  setup(ctx: HostCtx) {
     const cfg = loadConfig()
     const slideDefs = buildSlideDefs(cfg)
     for (let i = 0; i < slideDefs.length; i++) {
@@ -299,21 +326,23 @@ const plugin = {
         logLine({ event: "slide-skip", index: i, label: def.label ?? null, reason: "disabled" })
         continue
       }
-      const items = await loadSlideItems(ctx, def.plugins ?? [])
-      setSlides("list", (list) => [
-        ...list.filter((s) => s.id !== `slide-${i}`),
-        { id: `slide-${i}`, label: def.label ?? `Slide ${i + 1}`, order: i, seq: seq++, items },
-      ])
-      logLine({ event: "slide", index: i, label: def.label ?? null, items: items.length })
+      void loadSlideItems(ctx, def.plugins ?? []).then((items) => {
+        setSlides("list", (list) => [
+          ...list.filter((s) => s.id !== `slide-${i}`),
+          { id: `slide-${i}`, label: def.label ?? `Slide ${i + 1}`, order: i, seq: seq++, items },
+        ])
+        logLine({ event: "slide", index: i, label: def.label ?? null, items: items.length })
+      })
     }
     ctx.ui.slot({
       append: "sidebar.content",
       render: (input) => {
-        logLine({ event: "slot-render", input: input as unknown })
+        logLine({ event: "slot-render", input: (input ?? {}) as unknown })
         return <Carousel ctx={ctx} sessionID={input?.sessionID} />
       },
     })
+    logLine({ event: "setup-done" })
   },
-}
+})
 
 export default plugin

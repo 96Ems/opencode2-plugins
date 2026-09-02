@@ -1,8 +1,20 @@
 /** @jsxImportSource @opentui/solid */
+/**
+ * tui-go-usage — Go usage widget for the opencode2 sidebar.
+ *
+ * Modern opencode2 CLI plugin API:
+ *   - default export = `Plugin.define({ id, setup })` from `@opencode-ai/plugin/tui`
+ *   - `setup(context)` registers the widget via `context.ui.slot({ append: "sidebar.content", render })`
+ *
+ * Installation (discovery layout, auto-loaded by the opencode2 TUI):
+ *   ~/.config/opencode/plugins/go-usage/tui.ts   -> re-exports this file
+ *   ~/.config/opencode/plugins/go-usage/index.ts -> minimal server stub
+ */
 import { createSignal, For, onCleanup, Show } from "solid-js"
-import { readFile } from "node:fs/promises"
+import { readFile, appendFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
+import { Plugin } from "@opencode-ai/plugin/tui"
 
 const id = "go-usage"
 
@@ -19,20 +31,34 @@ type Theme = {
       success: { default: string }
       warning: { default: string }
       error: { default: string }
-      info: { default: string }
+      info?: { default: string }
     }
   }
-  border: { default: string }
+  border?: { default: string }
 }
 
-type PluginCtx = {
+type Ctx = {
   theme: Theme
   data: { on: (type: string, handler: (event: unknown) => void) => () => void }
-  ui: { slot: (def: { append: string; render: () => unknown }) => void }
+  ui: {
+    slot: (def: { append: string; render: (input: { sessionID?: string }) => unknown }) => void
+    toast: { show: (opts: { variant?: string; message: string }) => void }
+  }
 }
 
 type UsageWindow = { status: string; percent: number; resetsAt: string }
 type UsagePayload = { usage: { rolling: UsageWindow; weekly: UsageWindow; monthly: UsageWindow } }
+
+function logLine(obj: Record<string, unknown>): void {
+  try {
+    void appendFile(
+      "/tmp/opencode/go-usage-load.jsonl",
+      JSON.stringify({ ts: new Date().toISOString(), ...obj }) + "\n",
+    )
+  } catch {
+    /* ignore */
+  }
+}
 
 async function readApiKey(): Promise<string | undefined> {
   if (process.env.OPENCODE_GO_API_KEY) return process.env.OPENCODE_GO_API_KEY
@@ -56,10 +82,14 @@ async function fetchUsage(): Promise<UsagePayload> {
 }
 
 function statusColor(theme: Theme, percent: number) {
-  if (percent < 25) return theme.text.feedback.info.default
+  if (percent < 25) return theme.text.feedback.info?.default ?? theme.text.subdued
   if (percent < 50) return theme.text.feedback.success.default
   if (percent < 75) return theme.text.feedback.warning.default
   return theme.text.feedback.error.default
+}
+
+function borderColor(theme: Theme): string {
+  return theme.border?.default ?? theme.text.subdued
 }
 
 function formatReset(ms: number) {
@@ -106,7 +136,7 @@ function Bar(props: { percent: number; color: string; muted: string }) {
 }
 
 function WindowRow(props: {
-  ctx: PluginCtx
+  ctx: Ctx
   kind: WindowKind
   win: UsageWindow
   now: number
@@ -115,7 +145,7 @@ function WindowRow(props: {
   const color = statusColor(theme(), props.win.percent)
   const muted = () => theme().text.subdued
   return (
-    <box flexDirection="row" gap={1} border={["left"]} borderColor={theme().border.default} paddingLeft={1}>
+    <box flexDirection="row" gap={1} border={["left"]} borderColor={borderColor(theme())} paddingLeft={1}>
       <text width={4} wrapMode="none" fg={props.kind === "rolling" ? color : muted()}>
         {windowLabel(props.kind)}
       </text>
@@ -132,7 +162,7 @@ function WindowRow(props: {
   )
 }
 
-function View(props: { ctx: PluginCtx }) {
+function View(props: { ctx: Ctx }) {
   const theme = () => props.ctx.theme
   const [data, setData] = createSignal<UsagePayload | undefined>()
   const [error, setError] = createSignal<string | undefined>()
@@ -178,11 +208,13 @@ function View(props: { ctx: PluginCtx }) {
       when={data()}
       fallback={
         <Show when={error()}>
-          <box flexDirection="row" gap={1}>
+          <box flexDirection="row" gap={0} marginLeft={1}>
             <text fg={theme().text.default}>
               <b>Go Usage</b>
             </text>
-            <text fg={theme().text.subdued}>key missing</text>
+            <text fg={theme().text.subdued}>
+              {error() === "no go api key" ? " key missing" : " · error"}
+            </text>
           </box>
         </Show>
       }
@@ -194,7 +226,7 @@ function View(props: { ctx: PluginCtx }) {
           d().usage.monthly.percent,
         )
         return (
-          <box gap={1}>
+          <box flexDirection="column" gap={1} marginLeft={1}>
             <box flexDirection="row" gap={1}>
               <text fg={statusColor(theme(), worst)}>●</text>
               <text fg={theme().text.default}>
@@ -222,14 +254,15 @@ function View(props: { ctx: PluginCtx }) {
   )
 }
 
-const plugin = {
+const plugin = Plugin.define({
   id,
-  async setup(ctx: PluginCtx) {
-    ctx.ui.slot({
+  setup(context: Ctx) {
+    logLine({ event: "setup" })
+    context.ui.slot({
       append: "sidebar.content",
-      render: () => <View ctx={ctx} />,
+      render: () => <View ctx={context} />,
     })
   },
-}
+})
 
 export default plugin

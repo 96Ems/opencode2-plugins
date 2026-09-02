@@ -1,5 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js"
+import { Plugin } from "@opencode-ai/plugin/tui"
 import { fit, loadGit, loadPatch, CWD, type GitEntry, type Theme } from "/home/emericclement/dev/opencode2-plugins/shared/git-core.ts"
 
 const id = "git-changes"
@@ -232,14 +233,14 @@ function GitChangesPanel(props: { ctx: PluginCtx; sessionID?: string }) {
   )
 }
 
-const plugin = {
+const plugin = Plugin.define({
   id,
-  async setup(ctx: PluginCtx) {
+  setup(ctx: PluginCtx) {
     ctx.ui.slot({
       append: "sidebar.content",
       render: (input) => <GitChangesPanel ctx={ctx} sessionID={input?.sessionID} />,
     })
   },
-}
+})
 
 export default plugin
